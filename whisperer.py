@@ -8,11 +8,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import wx
+import wx.adv
 
 APP_NAME = "Whisperer"
+APP_VERSION = "1.1"
 EXE_NAME = "whisper-ctranslate2"
 CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME / "config.json"
 
@@ -21,6 +24,19 @@ MODELS = ("tiny", "base", "small", "medium", "large-v2", "large-v3",
 LANGUAGES = ("Auto", "en", "vi", "ja", "ko", "zh", "fr", "de", "es", "ru", "id", "th")
 TASKS = ("transcribe", "translate")
 FORMATS = ("txt", "srt", "vtt", "tsv", "json", "all")
+
+# HuggingFace repos faster-whisper downloads each model from; used to detect
+# an already-cached model so runs can skip the online version check
+MODEL_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+}
 
 MEDIA_WILDCARD = (
     "Audio/Video files|*.mp3;*.wav;*.m4a;*.flac;*.ogg;*.opus;*.aac;*.wma;"
@@ -90,6 +106,49 @@ def write_config(cfg):
         pass
 
 
+def model_is_cached(model):
+    """True when the model already sits in the HuggingFace cache, so the run
+    can pass --local_files_only and skip the online version check."""
+    repo = MODEL_REPOS.get(model)
+    if not repo:
+        return False
+    cache = os.environ.get("HF_HUB_CACHE")
+    if not cache:
+        home = os.environ.get("HF_HOME")
+        base = Path(home) if home else Path.home() / ".cache" / "huggingface"
+        cache = str(base / "hub")
+    snapshots = Path(cache) / ("models--" + repo.replace("/", "--")) / "snapshots"
+    try:
+        return any(snapshots.iterdir())
+    except OSError:
+        return False
+
+
+def output_written(job, since):
+    """True if the run produced its output file(s).
+
+    whisper-ctranslate2 swallows per-file decode errors and still exits 0,
+    so a missing/stale output is the only reliable failure signal."""
+    stem = Path(job["audio"]).stem
+    fmt = job["output_format"]
+    exts = ("txt", "srt", "vtt", "tsv", "json") if fmt == "all" else (fmt,)
+    for ext in exts:
+        path = Path(job["output_dir"]) / ("%s.%s" % (stem, ext))
+        try:
+            if path.stat().st_mtime >= since - 2:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def cache_incomplete(tail):
+    # a --local_files_only run tripped over a hole in the HF cache
+    text = "\n".join(tail).lower()
+    return any(s in text for s in ("local_files_only", "cached snapshot",
+                                   "disk cache", "offline"))
+
+
 def build_cmd(exe, job):
     cmd = [
         exe, job["audio"],
@@ -103,6 +162,8 @@ def build_cmd(exe, job):
     ]
     if job["language"] != "Auto":
         cmd += ["--language", job["language"]]
+    if job.get("local_only"):
+        cmd += ["--local_files_only", "True"]
     if job.get("force_cpu"):
         cmd += ["--device", "cpu"]
     return cmd
@@ -196,30 +257,44 @@ def kill_tree(pid):
 
 # --------------------------------------------------------------------------- UI
 
+class FileDrop(wx.FileDropTarget):
+    def __init__(self, frame):
+        super().__init__()
+        self.frame = frame
+
+    def OnDropFiles(self, x, y, filenames):
+        return self.frame.on_drop_files(filenames)
+
+
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title=APP_NAME)
+        super().__init__(None, title="%s %s" % (APP_NAME, APP_VERSION))
         self.exe = find_whisper()
         self.cfg = read_config()
         self.proc = None
         self.busy = None            # None | "run" | "install"
         self.cancelled = False
         self.pct_seen = False
-        self.last_job = None
+        self.files = []
+        self.batch = None
         self._auto_outdir = ""
 
         panel = wx.Panel(self)
         outer = wx.BoxSizer(wx.VERTICAL)
         PAD = wx.EXPAND | wx.LEFT | wx.RIGHT
 
-        outer.Add(wx.StaticText(panel, label="Audio file"), 0,
-                  wx.LEFT | wx.RIGHT | wx.TOP, 12)
+        outer.Add(wx.StaticText(panel, label="Input files (browse or drop files here)"),
+                  0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
         row = wx.BoxSizer(wx.HORIZONTAL)
-        self.audio_txt = wx.TextCtrl(panel)
+        self.file_list = wx.ListCtrl(panel, style=wx.LC_REPORT)
+        self.file_list.InsertColumn(0, "File", width=350)
+        self.file_list.InsertColumn(1, "Status", width=120)
+        self.file_list.SetMinSize(wx.Size(-1, 110))
         btn_audio = wx.Button(panel, label="Browse...")
-        row.Add(self.audio_txt, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        row.Add(self.file_list, 1, wx.EXPAND | wx.RIGHT, 6)
         row.Add(btn_audio, 0)
-        outer.Add(row, 0, PAD | wx.TOP, 4)
+        outer.Add(row, 1, PAD | wx.TOP, 4)
+        self.file_list.SetDropTarget(FileDrop(self))
 
         row = wx.BoxSizer(wx.HORIZONTAL)
         self.model_ch = wx.Choice(panel, choices=list(MODELS))
@@ -317,19 +392,38 @@ class MainFrame(wx.Frame):
     # ------------------------------------------------------------------ events
 
     def on_browse_audio(self, _):
-        with wx.FileDialog(self, "Choose an audio or video file",
+        if self.busy:
+            return
+        with wx.FileDialog(self, "Choose audio or video files",
                            defaultDir=self.cfg.get("last_dir", ""),
                            wildcard=MEDIA_WILDCARD,
-                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST
+                           | wx.FD_MULTIPLE) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
-            path = dlg.GetPath()
-        self.audio_txt.SetValue(path)
-        self.cfg["last_dir"] = os.path.dirname(path)
+            paths = dlg.GetPaths()
+        self.set_files(paths)
+
+    def on_drop_files(self, paths):
+        if self.busy:
+            return False
+        return self.set_files(paths)
+
+    def set_files(self, paths):
+        files = [p for p in paths if Path(p).is_file()]
+        if not files:
+            return False
+        self.files = files
+        self.file_list.DeleteAllItems()
+        for i, path in enumerate(files):
+            self.file_list.InsertItem(i, os.path.basename(path))
+        self.cfg["last_dir"] = os.path.dirname(files[0])
         out = self.out_txt.GetValue().strip()
         if not out or out == self._auto_outdir:
-            self._auto_outdir = os.path.dirname(path)
+            self._auto_outdir = os.path.dirname(files[0])
             self.out_txt.SetValue(self._auto_outdir)
+        self.set_status("%d file(s) selected." % len(files))
+        return True
 
     def on_browse_out(self, _):
         with wx.DirDialog(self, "Choose the output folder",
@@ -345,12 +439,14 @@ class MainFrame(wx.Frame):
         if not self.exe:
             self.prompt_install()
             return
-        audio = self.audio_txt.GetValue().strip().strip('"')
-        if not (audio and Path(audio).is_file()):
-            wx.MessageBox("Please choose an audio file first.", APP_NAME,
-                          wx.ICON_WARNING, self)
+        files = [f for f in self.files if Path(f).is_file()]
+        if not files:
+            wx.MessageBox("Please choose one or more audio files first.",
+                          APP_NAME, wx.ICON_WARNING, self)
             return
-        outdir = self.out_txt.GetValue().strip() or os.path.dirname(audio) or "."
+        if len(files) != len(self.files):
+            self.set_files(files)       # some inputs disappeared since selection
+        outdir = self.out_txt.GetValue().strip() or os.path.dirname(files[0]) or "."
         try:
             os.makedirs(outdir, exist_ok=True)
         except OSError:
@@ -358,8 +454,9 @@ class MainFrame(wx.Frame):
                           APP_NAME, wx.ICON_ERROR, self)
             return
         self.save_config()
-        self.start_run({
-            "audio": audio,
+        local_only = model_is_cached(self.model_ch.GetStringSelection())
+        self.start_batch([{
+            "audio": f,
             "output_dir": outdir,
             "model": self.model_ch.GetStringSelection(),
             "language": self.lang_cb.GetValue().strip() or "Auto",
@@ -367,7 +464,8 @@ class MainFrame(wx.Frame):
             "output_format": self.fmt_ch.GetStringSelection(),
             "vad": self.vad_cb.GetValue(),
             "word_timestamps": self.words_cb.GetValue(),
-        })
+            "local_only": local_only,
+        } for f in files])
 
     def on_cancel(self, _):
         if self.busy:
@@ -390,16 +488,32 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------------------------ running
 
-    def start_run(self, job):
+    def start_batch(self, jobs):
+        # files run one at a time, each in its own CLI process: a broken file
+        # only fails itself, and finished transcripts are on disk immediately
+        self.batch = {"jobs": jobs, "index": 0, "ok": 0, "failed": []}
+        self.set_busy("run")
+        for i in range(len(jobs)):
+            self.file_status(i, "Waiting")
+        self.start_file()
+
+    def start_file(self):
+        b = self.batch
+        i, job = b["index"], b["jobs"][b["index"]]
+        job["started_at"] = time.time()
         try:
             self.proc = popen_stream(build_cmd(self.exe, job))
         except OSError:
+            self.batch = None
+            self.set_idle()
             self.exe = None
             self.prompt_install()
             return
-        self.last_job = job
-        self.set_busy("run")
-        self.set_status("Starting... (the first run may download the model)")
+        self.file_status(i, "Starting...")
+        note = "" if job.get("local_only") else " (may download the model first)"
+        self.set_status("[%d/%d] %s — starting...%s"
+                        % (i + 1, len(b["jobs"]),
+                           os.path.basename(job["audio"]), note))
         threading.Thread(target=self._run_worker, args=(self.proc,),
                          daemon=True).start()
 
@@ -409,40 +523,137 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self.on_run_finished, rc, tail)
 
     def on_output_line(self, line):
+        b = self.batch
+        if not b:
+            return
+        i, total = b["index"], len(b["jobs"])
         m = PCT_TQDM.search(line) or PCT_ANY.search(line)
         if m:
+            pct = min(100, int(m.group(1)))
             if not self.pct_seen:
                 self.pct_seen = True
                 self.pulse.Stop()
-            self.gauge.SetValue(min(100, int(m.group(1))))
+            self.gauge.SetValue(int((i * 100 + pct) / total))
+            self.file_status(i, "%d%%" % pct)
+            self.set_status("[%d/%d] %s — %d%%"
+                            % (i + 1, total,
+                               os.path.basename(b["jobs"][i]["audio"]), pct))
         else:
-            self.set_status(line)
+            self.set_status("[%d/%d] %s" % (i + 1, total, line))
 
     def on_run_finished(self, rc, tail):
-        job = self.last_job
+        b = self.batch
         self.proc = None
-        self.set_idle()
+        if b is None:
+            self.set_idle()
+            return
+        i = b["index"]
+        job = b["jobs"][i]
+        name = os.path.basename(job["audio"])
         if self.cancelled:
+            for row in range(i, len(b["jobs"])):
+                self.file_status(row, "Cancelled")
+            self.batch = None
+            self.set_idle()
             self.set_status("Cancelled.")
             return
         if rc == 0:
-            self.gauge.SetValue(100)
-            self.set_status("Done.")
-            if wx.MessageBox("Done. Open the output folder?", APP_NAME,
-                             wx.YES_NO | wx.ICON_INFORMATION, self) == wx.YES:
-                try:
-                    os.startfile(job["output_dir"])
-                except OSError:
-                    pass
+            if output_written(job, job["started_at"]):
+                b["ok"] += 1
+                self.file_status(i, "Done")
+                self.notify("Done: %s" % name)
+            else:
+                # exit 0 but no transcript: the CLI swallowed a per-file error
+                _, msg = classify_error(rc, tail, True)
+                b["failed"].append((name, msg))
+                self.file_status(i, "Failed")
+            self.advance()
+            return
+        if job.get("local_only") and cache_incomplete(tail):
+            # the cached model was incomplete after all: redo with network access
+            for j in b["jobs"]:
+                j["local_only"] = False
+            self.start_file()
             return
         kind, msg = classify_error(rc, tail, job.get("force_cpu", False))
-        self.set_status("Failed.")
         if kind == "cuda":
             if wx.MessageBox(msg, APP_NAME,
                              wx.YES_NO | wx.ICON_WARNING, self) == wx.YES:
-                self.start_run({**job, "force_cpu": True})
+                for j in b["jobs"]:
+                    j["force_cpu"] = True
+                self.start_file()
+                return
+            # no GPU and CPU declined: every remaining file would fail the same way
+            b["failed"].append((name, "GPU (CUDA) isn't available."))
+            self.file_status(i, "Failed")
+            for row in range(i + 1, len(b["jobs"])):
+                self.file_status(row, "Skipped")
+            self.finish_batch()
+            return
+        b["failed"].append((name, msg))
+        self.file_status(i, "Failed")
+        self.advance()
+
+    def advance(self):
+        b = self.batch
+        b["index"] += 1
+        if not self.pct_seen:
+            self.pct_seen = True
+            self.pulse.Stop()
+        self.gauge.SetValue(int(b["index"] * 100 / len(b["jobs"])))
+        if b["index"] < len(b["jobs"]):
+            self.start_file()
         else:
-            wx.MessageBox(msg, APP_NAME, wx.ICON_ERROR, self)
+            self.finish_batch()
+
+    def finish_batch(self):
+        b = self.batch
+        self.batch = None
+        self.set_idle()
+        total, ok, failed = len(b["jobs"]), b["ok"], b["failed"]
+        outdir = b["jobs"][0]["output_dir"]
+        if ok == total:
+            self.gauge.SetValue(100)
+            self.set_status("Done.")
+            msg = ("Done. %d files transcribed.\n\nOpen the output folder?" % total
+                   if total > 1 else "Done. Open the output folder?")
+            if wx.MessageBox(msg, APP_NAME,
+                             wx.YES_NO | wx.ICON_INFORMATION, self) == wx.YES:
+                self.open_folder(outdir)
+            return
+        detail = "\n".join("%s — %s" % (n, m.splitlines()[0])
+                           for n, m in failed[:5])
+        if len(failed) > 5:
+            detail += "\n(and %d more)" % (len(failed) - 5)
+        if ok:
+            self.set_status("Done with errors.")
+            if wx.MessageBox("Finished: %d ok, %d failed.\n\n%s\n\n"
+                             "Open the output folder?" % (ok, len(failed), detail),
+                             APP_NAME, wx.YES_NO | wx.ICON_WARNING, self) == wx.YES:
+                self.open_folder(outdir)
+        else:
+            self.set_status("Failed.")
+            if len(failed) == 1:
+                wx.MessageBox(failed[0][1], APP_NAME, wx.ICON_ERROR, self)
+            else:
+                wx.MessageBox("All files failed.\n\n%s" % detail,
+                              APP_NAME, wx.ICON_ERROR, self)
+
+    def open_folder(self, path):
+        try:
+            os.startfile(path)
+        except OSError:
+            pass
+
+    def notify(self, message):
+        try:
+            wx.adv.NotificationMessage(APP_NAME, message).Show()
+        except Exception:
+            pass
+
+    def file_status(self, row, text):
+        if 0 <= row < self.file_list.GetItemCount():
+            self.file_list.SetItem(row, 1, text)
 
     # ------------------------------------------------------------------ install
 

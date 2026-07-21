@@ -1,7 +1,7 @@
 # Whisperer
 
 A tiny Windows GUI wrapper around the [whisper-ctranslate2](https://github.com/Softcatala/whisper-ctranslate2) CLI.
-Pick an audio/video file, choose a model and options, click **Whisper** — get transcripts (txt/srt/vtt/...) in the output folder. If whisper-ctranslate2 is missing, the app offers to install it via pipx.
+Pick one or more audio/video files (or drag & drop them into the file list), choose a model and options, click **Whisper** — each transcript (txt/srt/vtt/...) lands in the output folder, named after its input file. Files are processed one at a time: a toast notification fires as each finishes, and a broken file only fails itself. If whisper-ctranslate2 is missing, the app offers to install it via pipx.
 
 ## Run from source
 
@@ -15,7 +15,7 @@ python -m venv .venv
 
 ```
 .venv\Scripts\pip install pyinstaller
-.venv\Scripts\pyinstaller --noconsole --onefile --name Whisperer whisperer.py
+.venv\Scripts\pyinstaller Whisperer.spec
 ```
 
-The exe lands in `dist\Whisperer.exe`. Settings persist in `%APPDATA%\Whisperer\config.json`.
+The exe lands in `dist\Whisperer-1.1.exe`. Settings persist in `%APPDATA%\Whisperer\config.json`.
