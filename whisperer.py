@@ -7,8 +7,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 import wx
@@ -36,6 +38,19 @@ MODEL_REPOS = {
     "large-v3": "Systran/faster-whisper-large-v3",
     "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+}
+
+# approximate download size in MiB + one-line characterization; the size also
+# drives the download progress estimate (the CLI prints no progress into pipes)
+MODEL_INFO = {
+    "tiny": (75, "Fastest, lowest accuracy"),
+    "base": (145, "Very fast, basic accuracy"),
+    "small": (484, "Good balance of speed and accuracy"),
+    "medium": (1536, "Accurate, noticeably slower"),
+    "large-v2": (3175, "High accuracy (previous generation)"),
+    "large-v3": (3175, "Most accurate"),
+    "large-v3-turbo": (1638, "Near large-v3 accuracy, much faster"),
+    "distil-large-v3": (1536, "Fast, English only"),
 }
 
 MEDIA_WILDCARD = (
@@ -106,22 +121,71 @@ def write_config(cfg):
         pass
 
 
-def model_is_cached(model):
-    """True when the model already sits in the HuggingFace cache, so the run
-    can pass --local_files_only and skip the online version check."""
+def hf_model_dir(model):
+    """The model's HuggingFace cache directory (may not exist yet)."""
     repo = MODEL_REPOS.get(model)
     if not repo:
-        return False
+        return None
     cache = os.environ.get("HF_HUB_CACHE")
     if not cache:
         home = os.environ.get("HF_HOME")
         base = Path(home) if home else Path.home() / ".cache" / "huggingface"
         cache = str(base / "hub")
-    snapshots = Path(cache) / ("models--" + repo.replace("/", "--")) / "snapshots"
+    return Path(cache) / ("models--" + repo.replace("/", "--"))
+
+
+def model_is_cached(model):
+    """True when the model already sits complete in the HuggingFace cache, so
+    the run can pass --local_files_only and skip the online version check.
+
+    A snapshot entry for model.bin only appears once the weights finished
+    downloading; an interrupted download leaves only *.incomplete blobs."""
+    root = hf_model_dir(model)
+    if root is None:
+        return False
     try:
-        return any(snapshots.iterdir())
+        return any((snap / "model.bin").is_file()
+                   for snap in (root / "snapshots").iterdir())
     except OSError:
         return False
+
+
+def model_disk_size(model):
+    """Bytes the model occupies in the cache (hard-linked files count once)."""
+    root = hf_model_dir(model)
+    if root is None:
+        return 0
+    total, seen = 0, set()
+    try:
+        for path in root.rglob("*"):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if not path.is_file():
+                continue
+            key = (st.st_dev, st.st_ino)
+            if st.st_ino and key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+    except OSError:
+        pass
+    return total
+
+
+def fmt_size(n):
+    if n >= 1 << 30:
+        return "%.1f GB" % (n / (1 << 30))
+    return "%d MB" % round(n / (1 << 20))
+
+
+def write_silent_wav(path, seconds=0.5):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * int(16000 * seconds))
 
 
 def output_written(job, since):
@@ -277,6 +341,7 @@ class MainFrame(wx.Frame):
         self.pct_seen = False
         self.files = []
         self.batch = None
+        self.download = None        # (model, tmpdir) while busy == "download"
         self._auto_outdir = ""
 
         panel = wx.Panel(self)
@@ -297,10 +362,22 @@ class MainFrame(wx.Frame):
         self.file_list.SetDropTarget(FileDrop(self))
 
         row = wx.BoxSizer(wx.HORIZONTAL)
-        self.model_ch = wx.Choice(panel, choices=list(MODELS))
+        row.Add(wx.StaticText(panel, label="Model"), 0, wx.ALIGN_CENTER_VERTICAL)
+        row.AddStretchSpacer()
+        self.dl_btn = wx.Button(panel, label="Download selected model")
+        row.Add(self.dl_btn, 0)
+        outer.Add(row, 0, PAD | wx.TOP, 12)
+        self.model_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        for col, (label, width) in enumerate(
+                (("Model", 130), ("Size", 70), ("Notes", 250), ("Status", 110))):
+            self.model_list.InsertColumn(col, label, width=width)
+        self.model_list.SetMinSize(wx.Size(-1, 178))
+        outer.Add(self.model_list, 0, PAD | wx.TOP, 4)
+
+        row = wx.BoxSizer(wx.HORIZONTAL)
         self.lang_cb = wx.ComboBox(panel, value="Auto", choices=list(LANGUAGES))
         self.task_ch = wx.Choice(panel, choices=list(TASKS))
-        for label, ctrl in (("Model", self.model_ch), ("Language", self.lang_cb),
+        for label, ctrl in (("Language", self.lang_cb),
                             ("Task", self.task_ch)):
             row.Add(wx.StaticText(panel, label=label), 0,
                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
@@ -357,12 +434,20 @@ class MainFrame(wx.Frame):
 
         self.pulse = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, lambda e: self.gauge.Pulse(), self.pulse)
+        self.dl_poll = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_dl_poll, self.dl_poll)
         btn_audio.Bind(wx.EVT_BUTTON, self.on_browse_audio)
         btn_out.Bind(wx.EVT_BUTTON, self.on_browse_out)
         self.whisper_btn.Bind(wx.EVT_BUTTON, self.on_whisper)
         self.cancel_btn.Bind(wx.EVT_BUTTON, self.on_cancel)
+        self.dl_btn.Bind(wx.EVT_BUTTON, self.on_download)
+        self.model_list.Bind(wx.EVT_LIST_ITEM_SELECTED,
+                             lambda e: self.update_dl_btn())
+        self.model_list.Bind(wx.EVT_LIST_ITEM_DESELECTED,
+                             lambda e: self.update_dl_btn())
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
+        self.refresh_models()
         self.apply_config()
 
     # ------------------------------------------------------------------ config
@@ -371,7 +456,7 @@ class MainFrame(wx.Frame):
         def pick(ctrl, value, default):
             if not (value and ctrl.SetStringSelection(value)):
                 ctrl.SetStringSelection(default)
-        pick(self.model_ch, self.cfg.get("model"), "small")
+        self.select_model(self.cfg.get("model"))
         pick(self.task_ch, self.cfg.get("task"), "transcribe")
         pick(self.fmt_ch, self.cfg.get("output_format"), "txt")
         self.lang_cb.SetValue(self.cfg.get("language") or "Auto")
@@ -380,7 +465,7 @@ class MainFrame(wx.Frame):
 
     def save_config(self):
         self.cfg.update(
-            model=self.model_ch.GetStringSelection(),
+            model=self.selected_model(),
             language=self.lang_cb.GetValue().strip() or "Auto",
             task=self.task_ch.GetStringSelection(),
             output_format=self.fmt_ch.GetStringSelection(),
@@ -454,11 +539,12 @@ class MainFrame(wx.Frame):
                           APP_NAME, wx.ICON_ERROR, self)
             return
         self.save_config()
-        local_only = model_is_cached(self.model_ch.GetStringSelection())
+        model = self.selected_model()
+        local_only = model_is_cached(model)
         self.start_batch([{
             "audio": f,
             "output_dir": outdir,
-            "model": self.model_ch.GetStringSelection(),
+            "model": model,
             "language": self.lang_cb.GetValue().strip() or "Auto",
             "task": self.task_ch.GetStringSelection(),
             "output_format": self.fmt_ch.GetStringSelection(),
@@ -483,6 +569,8 @@ class MainFrame(wx.Frame):
         self.cancelled = True
         if self.proc:
             kill_tree(self.proc.pid)
+        if self.download:
+            shutil.rmtree(self.download[1], ignore_errors=True)
         self.save_config()
         self.Destroy()
 
@@ -655,6 +743,117 @@ class MainFrame(wx.Frame):
         if 0 <= row < self.file_list.GetItemCount():
             self.file_list.SetItem(row, 1, text)
 
+    # ------------------------------------------------------------------ models
+
+    def selected_model(self):
+        i = self.model_list.GetFirstSelected()
+        return MODELS[i] if i != -1 else "small"
+
+    def select_model(self, name):
+        i = MODELS.index(name if name in MODELS else "small")
+        self.model_list.Select(i)
+        self.model_list.Focus(i)
+        self.model_list.EnsureVisible(i)
+
+    def refresh_models(self):
+        for i, model in enumerate(MODELS):
+            if self.model_list.GetItemCount() <= i:
+                self.model_list.InsertItem(i, model)
+                self.model_list.SetItem(i, 2, MODEL_INFO[model][1])
+            approx = fmt_size(MODEL_INFO[model][0] << 20)
+            if model_is_cached(model):
+                size = model_disk_size(model)
+                self.model_list.SetItem(i, 1, fmt_size(size) if size else approx)
+                self.model_list.SetItem(i, 3, "✓ Downloaded")
+            else:
+                self.model_list.SetItem(i, 1, approx)
+                self.model_list.SetItem(i, 3, "")
+        self.update_dl_btn()
+
+    def update_dl_btn(self):
+        self.dl_btn.Enable(not self.busy
+                           and not model_is_cached(self.selected_model()))
+
+    def on_download(self, _):
+        if self.busy:
+            return
+        model = self.selected_model()
+        if model_is_cached(model):
+            return
+        if not (self.exe and Path(self.exe).is_file()):
+            self.exe = find_whisper()
+        if not self.exe:
+            self.prompt_install()
+            return
+        tmpdir = tempfile.mkdtemp(prefix="whisperer-dl-")
+        wav = Path(tmpdir) / "silence.wav"
+        try:
+            write_silent_wav(wav)
+        except OSError:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            wx.MessageBox("Couldn't create a temporary file.", APP_NAME,
+                          wx.ICON_ERROR, self)
+            return
+        # transcribing half a second of silence on CPU makes the CLI fetch the
+        # model with its own downloader, straight into the right cache
+        cmd = [self.exe, str(wav), "--model", model, "--device", "cpu",
+               "--language", "en", "--output_dir", tmpdir,
+               "--output_format", "txt", "--verbose", "False"]
+        try:
+            self.proc = popen_stream(cmd)
+        except OSError:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            self.exe = None
+            self.prompt_install()
+            return
+        self.download = (model, tmpdir)
+        self.set_busy("download")
+        self.set_status("Downloading model %s..." % model)
+        self.dl_poll.Start(1000)
+        threading.Thread(target=self._download_worker, args=(self.proc,),
+                         daemon=True).start()
+
+    def _download_worker(self, proc):
+        # the CLI prints no download progress into a pipe; the poll timer
+        # tracks the growing cache instead, so lines are only kept for errors
+        rc, tail = stream_process(proc, lambda line: None)
+        wx.CallAfter(self.on_download_finished, rc, tail)
+
+    def on_dl_poll(self, _):
+        if self.busy != "download" or not self.download:
+            return
+        model = self.download[0]
+        done = model_disk_size(model)
+        if not done:
+            return
+        if not self.pct_seen:
+            self.pct_seen = True
+            self.pulse.Stop()
+        pct = min(99, done * 100 // (MODEL_INFO[model][0] << 20))
+        self.gauge.SetValue(pct)
+        self.set_status("Downloading model %s — %d%% (%s of ~%s)"
+                        % (model, pct, fmt_size(done),
+                           fmt_size(MODEL_INFO[model][0] << 20)))
+
+    def on_download_finished(self, rc, tail):
+        self.dl_poll.Stop()
+        self.proc = None
+        model, tmpdir = self.download
+        self.download = None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        self.set_idle()
+        if self.cancelled:
+            self.set_status("Cancelled.")
+            return
+        # the temp transcription may fail (e.g. out of memory) after the
+        # download itself succeeded; the cache is the ground truth
+        if model_is_cached(model):
+            self.set_status("Model %s is ready." % model)
+            return
+        _, msg = classify_error(rc, tail, True)
+        self.set_status("Download failed.")
+        wx.MessageBox(msg, APP_NAME, wx.ICON_ERROR, self)
+
     # ------------------------------------------------------------------ install
 
     def prompt_install(self):
@@ -732,6 +931,7 @@ class MainFrame(wx.Frame):
         self.cancelled = False
         self.pct_seen = False
         self.whisper_btn.Disable()
+        self.dl_btn.Disable()
         self.cancel_btn.Enable()
         self.gauge.SetValue(0)
         self.pulse.Start(120)
@@ -742,6 +942,7 @@ class MainFrame(wx.Frame):
         self.whisper_btn.Enable()
         self.cancel_btn.Disable()
         self.gauge.SetValue(0)
+        self.refresh_models()   # a run or download may have cached a model
 
     def set_status(self, text):
         text = " ".join(text.split())
